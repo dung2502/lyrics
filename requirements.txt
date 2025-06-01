@@ -7,3 +7,8 @@ regtag
 vinorm
 matplotlib
 tqdm
+uvicorn
+pydub
+soundfile
+requests
+beautifulsoup4
