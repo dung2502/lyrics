@@ -1,46 +1,58 @@
+import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import json
 import torch
 from lyric_alignment_api.model_handling import Wav2Vec2ForCTC
 from transformers import AutoTokenizer, AutoFeatureExtractor
 from lyric_alignment_api import utils
+from lyric_alignment_api.drive_utils import upload_json_to_drive
 
 model_path = 'nguyenvulebinh/lyric-alignment'
 use_gpu = torch.cuda.is_available()
 
-# Model, tokenizer, extractor, vocab
 model = None
 tokenizer = None
 feature_extractor = None
 vocab = None
 
+
 def load_model():
     global model, tokenizer, feature_extractor, vocab
-    model = Wav2Vec2ForCTC.from_pretrained(model_path).eval()
-    if use_gpu:
-        model = model.cuda()
+    device = torch.device("cuda" if use_gpu else "cpu")
+
+    model = Wav2Vec2ForCTC.from_pretrained(model_path).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     feature_extractor = AutoFeatureExtractor.from_pretrained(model_path)
     vocab = [tokenizer.convert_ids_to_tokens(i) for i in range(len(tokenizer.get_vocab()))]
 
+
 def do_asr(waveform):
-    input_values = feature_extractor.pad([
-        {"input_values": feature_extractor(item, sampling_rate=16000)["input_values"][0]} for item in waveform
-    ], return_tensors='pt')["input_values"]
+    try:
+        input_values = feature_extractor.pad([
+            {"input_values": feature_extractor(item, sampling_rate=16000)["input_values"][0]} for item in waveform
+        ], return_tensors='pt')["input_values"]
 
-    if use_gpu:
-        input_values = input_values.cuda()
+        input_values = input_values.to(model.device)
 
-    out_values = model(input_values=input_values)
-    logits = out_values.logits[0]
-    emissions = torch.log_softmax(logits, dim=-1)
-    emission = emissions.cpu().detach()
-    emission[emission < -20] = -20
+        with torch.no_grad():
+            out_values = model(input_values=input_values)
 
-    # Adjust special tokens
-    pipe_token = tokenizer.convert_tokens_to_ids('|')
-    pad_token = tokenizer.convert_tokens_to_ids('<pad>')
-    emission[:, pipe_token] = torch.max(emission[:, pipe_token], emission[:, pad_token])
-    emission[:, pad_token] = -20
-    return emission
+        logits = out_values.logits[0]
+        emissions = torch.log_softmax(logits, dim=-1)
+        emission = emissions.cpu().detach()
+        emission[emission < -20] = -20
+
+        pipe_token = tokenizer.convert_tokens_to_ids('|')
+        pad_token = tokenizer.convert_tokens_to_ids('<pad>')
+        emission[:, pipe_token] = torch.max(emission[:, pipe_token], emission[:, pad_token])
+        emission[:, pad_token] = -20
+
+        return emission
+    except torch.cuda.OutOfMemoryError as e:
+        torch.cuda.empty_cache()
+        raise RuntimeError("GPU out of memory in do_asr()") from e
+
 
 def do_force_align(waveform, emission, word_list, sample_rate=16000, base_stamp=0):
     transcript = '|'.join(word_list)
@@ -65,6 +77,7 @@ def do_force_align(waveform, emission, word_list, sample_rate=16000, base_stamp=
     assert [item['d'] for item in result] == word_list
     return result
 
+
 def align_lyrics(wav, lyric_alignment_json):
     seg_words = [[word['d'] for word in seg['l']] for seg in lyric_alignment_json]
     words = [y for x in seg_words for y in x]
@@ -75,7 +88,6 @@ def align_lyrics(wav, lyric_alignment_json):
     emission = do_asr(wav)
     word_piece = do_force_align(wav, emission, single_words)
 
-    # Ghép ngược lại vào cấu trúc lyrics
     words_align_result = []
     word_piece_idx = 0
     for idx in range(len(words)):
@@ -104,4 +116,17 @@ def align_lyrics(wav, lyric_alignment_json):
             segment_info['s'] = segment_info['l'][0]['s']
             segment_info['e'] = segment_info['l'][-1]['e']
 
-    return lyric_alignment_json
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+
+    # --- Lưu kết quả vào file JSON ---
+    json_path = "aligned_lyrics.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(lyric_alignment_json, f, ensure_ascii=False, indent=2)
+
+    # --- Upload lên Google Drive ---
+    gdrive_url = upload_json_to_drive(json_path, filename="aligned_lyrics.json")
+
+    # --- Trả về link Google Drive thay vì danh sách căn chỉnh ---
+    return {"status": "success", "url": gdrive_url}
