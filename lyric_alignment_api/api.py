@@ -60,3 +60,4 @@ async def align(req: AlignRequest):
         return JSONResponse(status_code=500, content={"error": f"Processing error: {str(e)}"})
 
     return JSONResponse(content=result)
+
